@@ -34,12 +34,12 @@
         "threads": 4,
         "seed": 8,
         "device": "cpu",
-        "gpu_id": 9
+        "gpu_id": 0
     },
     "paths": {
-        "data_path": "/export/home/chemmer/code/zero-shot-DSR/zero-shot-DSR-python/example_data/training_data_3D_30DS.npy",
-        "context_path": "/export/home/chemmer/code/zero-shot-DSR/zero-shot-DSR-python/example_data/training_context_3D_30DS.npy",
-        "test_path": "/export/home/chemmer/code/zero-shot-DSR/zero-shot-DSR-python/example_data/training_testdata_30DS.npy",
+        "data_path": "/path/to/data.npy",
+        "context_path": "/path/to/context.npy",
+        "test_path": "/path/to/testdata.npy",
         "save_path": "results/DynaMix-default"
     }
 }
