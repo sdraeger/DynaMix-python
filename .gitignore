@@ -44,3 +44,8 @@ venv/
 # IDE configs
 .idea/
 .vscode/
+
+*.safetensors
+*.npy
+*.npz
+*.pt

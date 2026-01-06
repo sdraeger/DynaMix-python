@@ -11,4 +11,4 @@ from . import training
 from .utilities.utilities import *
 from .model.dynamix import *
 from .metrics.metrics import *
-from .training.training import * 
+from .training.training import *
