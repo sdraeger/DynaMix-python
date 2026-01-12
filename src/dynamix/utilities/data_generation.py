@@ -23,6 +23,11 @@ from scipy.integrate import solve_ivp
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
 from tqdm import tqdm
+from multiprocessing import Pool, cpu_count, Manager
+
+# Global variables for multiprocessing progress tracking
+_shared_counter = None
+_shared_lock = None
 
 
 @dataclass
@@ -94,7 +99,20 @@ SYSTEM_CONFIGS = {
         param_ranges={"a": (32.0, 38.0), "b": (2.5, 3.5), "c": (25.0, 31.0)},
         default_ic_range=(-10.0, 10.0),
     ),
-    # 6. Colpitts (simplified jerk-like formulation)
+    # 6. Chua circuit - piecewise-linear chaotic oscillator
+    "chua": SystemConfig(
+        name="Chua",
+        dim=3,
+        default_params={"alpha": 15.6, "beta": 28.0, "m0": -1.143, "m1": -0.714},
+        param_ranges={
+            "alpha": (14.0, 17.0),
+            "beta": (25.0, 31.0),
+            "m0": (-1.3, -1.0),
+            "m1": (-0.8, -0.6),
+        },
+        default_ic_range=(-0.5, 0.5),
+    ),
+    # 7. Colpitts (simplified jerk-like formulation)
     "colpitts": SystemConfig(
         name="Colpitts",
         dim=3,
@@ -374,7 +392,15 @@ SYSTEM_CONFIGS = {
         param_ranges={},
         default_ic_range=(-1.0, 1.0),
     ),
-    # 31. StickSlipOscillator
+    # 31. Sprott M - one of Sprott's catalog of chaotic flows
+    "sprott_m": SystemConfig(
+        name="SprottM",
+        dim=3,
+        default_params={"a": 1.7, "b": 1.7},
+        param_ranges={"a": (1.5, 1.9), "b": (1.5, 1.9)},
+        default_ic_range=(-0.5, 0.5),
+    ),
+    # 32. StickSlipOscillator
     "stick_slip": SystemConfig(
         name="StickSlipOscillator",
         dim=3,
@@ -531,6 +557,28 @@ def chen(
     """Chen system - unified chaotic system."""
     x, y, z = state
     return np.array([a * (y - x), (c - a) * x - x * z + c * y, x * y - b * z])
+
+
+def chua(
+    t: float,
+    state: np.ndarray,
+    alpha: float = 15.6,
+    beta: float = 28.0,
+    m0: float = -1.143,
+    m1: float = -0.714,
+) -> np.ndarray:
+    """Chua circuit - piecewise-linear chaotic electronic oscillator.
+
+    The classic double-scroll attractor discovered by Leon Chua.
+    Uses the piecewise-linear resistor characteristic:
+    f(x) = m1*x + 0.5*(m0-m1)*(|x+1| - |x-1|)
+
+    Standard parameters produce the famous double-scroll attractor.
+    """
+    x, y, z = state
+    # Piecewise-linear function for Chua's diode
+    fx = m1 * x + 0.5 * (m0 - m1) * (np.abs(x + 1) - np.abs(x - 1))
+    return np.array([alpha * (y - x - fx), x - y + z, -beta * y])
 
 
 def colpitts(
@@ -904,10 +952,15 @@ def sprott_jerk(t: float, state: np.ndarray, a: float = 2.017) -> np.ndarray:
     z̈ = -az + y² - x
 
     The attractor is bounded for a ≈ 2.017 but numerical integration can
-    diverge for some initial conditions. Divergent trajectories are rejected
-    at the trajectory generation level.
+    diverge for some initial conditions. State clamping prevents divergence
+    during integration, and divergent trajectories are rejected at the
+    trajectory generation level.
     """
     x, y, z = state
+    # Clamp state to prevent divergence - attractor is bounded within ~10
+    x = np.clip(x, -50, 50)
+    y = np.clip(y, -50, 50)
+    z = np.clip(z, -50, 50)
     return np.array([y, z, -a * z + y**2 - x])
 
 
@@ -918,6 +971,23 @@ def sprott_linz(t: float, state: np.ndarray) -> np.ndarray:
     """
     x, y, z = state
     return np.array([y, -x - np.sign(z) * y, y**2 - np.exp(-(x**2))])
+
+
+def sprott_m(
+    t: float, state: np.ndarray, a: float = 1.7, b: float = 1.7
+) -> np.ndarray:
+    """Sprott M system - one of Sprott's catalog of simple chaotic flows.
+
+    From J.C. Sprott's classification of 3D chaotic systems with quadratic
+    nonlinearities. System M has the equations:
+        dx/dt = -z
+        dy/dt = -x^2 - y
+        dz/dt = a + bx + y
+
+    Produces a chaotic attractor for a = b = 1.7.
+    """
+    x, y, z = state
+    return np.array([-z, -x**2 - y, a + b * x + y])
 
 
 def stick_slip(
@@ -1013,6 +1083,7 @@ SYSTEM_FUNCTIONS = {
     "arneodo": arneodo,
     "belousov_zhabotinsky": belousov_zhabotinsky,
     "chen": chen,
+    "chua": chua,
     "colpitts": colpitts,
     "forced_brusselator": forced_brusselator,
     "forced_vanderpol": forced_vanderpol,
@@ -1038,6 +1109,7 @@ SYSTEM_FUNCTIONS = {
     "shimizu_morioka": shimizu_morioka,
     "sprott_jerk": sprott_jerk,
     "sprott_linz": sprott_linz,
+    "sprott_m": sprott_m,
     "stick_slip": stick_slip,
     "swinging_atwood": swinging_atwood,
     "thomas": thomas,
@@ -1049,6 +1121,597 @@ SYSTEM_FUNCTIONS = {
 }
 
 
+# =============================================================================
+# NONSTATIONARY DYNAMICAL SYSTEMS
+# These systems introduce various forms of nonstationarity to address the
+# limitation identified in the DynaMix paper (Section 5): "Changes in
+# statistical properties over time, tipping points, or widely differing
+# time scales in the data, impose severe difficulties for zero-shot forecasting"
+# =============================================================================
+
+
+class NonstationaryWrapper:
+    """Wrapper to add nonstationarity to any base dynamical system."""
+
+    def __init__(
+        self,
+        base_func,
+        nonstationarity_type: str,
+        **kwargs,
+    ):
+        """
+        Initialize the nonstationary wrapper.
+
+        Args:
+            base_func: Base ODE function to wrap
+            nonstationarity_type: One of:
+                - 'trend': Add polynomial trend to output
+                - 'parameter_drift': Slowly vary parameters over time
+                - 'regime_switch': Discrete parameter switches
+                - 'amplitude_modulation': Time-varying amplitude
+            **kwargs: Type-specific parameters
+        """
+        self.base_func = base_func
+        self.nonstationarity_type = nonstationarity_type
+        self.kwargs = kwargs
+
+    def __call__(self, t: float, state: np.ndarray, **params) -> np.ndarray:
+        """Apply the base system with nonstationarity."""
+        return self.base_func(t, state, **params)
+
+
+def add_trend_to_trajectory(
+    trajectory: np.ndarray,
+    t: np.ndarray,
+    trend_coeffs: Optional[np.ndarray] = None,
+    trend_type: str = "polynomial",
+) -> np.ndarray:
+    """
+    Add a trend to an existing trajectory (post-processing).
+
+    Args:
+        trajectory: Trajectory array of shape (T, dim)
+        t: Time array of shape (T,)
+        trend_coeffs: Coefficients for the trend. If None, random coefficients are generated.
+                     For polynomial: [a0, a1, a2] for a0 + a1*t + a2*t^2
+        trend_type: Type of trend ('polynomial', 'exponential', 'sinusoidal')
+
+    Returns:
+        Trajectory with trend added
+    """
+    T, dim = trajectory.shape
+    t_normalized = (t - t[0]) / (t[-1] - t[0])  # Normalize to [0, 1]
+
+    if trend_type == "polynomial":
+        if trend_coeffs is None:
+            # Random polynomial trend: a0 + a1*t + a2*t^2
+            # Scale coefficients to be proportional to trajectory std
+            std = np.std(trajectory, axis=0)
+            trend_coeffs = np.column_stack(
+                [
+                    np.random.uniform(-0.5, 0.5, dim) * std,  # constant offset
+                    np.random.uniform(-2.0, 2.0, dim) * std,  # linear
+                    np.random.uniform(-1.0, 1.0, dim) * std,  # quadratic
+                ]
+            )
+        trend = (
+            trend_coeffs[:, 0]
+            + trend_coeffs[:, 1] * t_normalized[:, None]
+            + trend_coeffs[:, 2] * (t_normalized[:, None] ** 2)
+        )
+    elif trend_type == "exponential":
+        if trend_coeffs is None:
+            std = np.std(trajectory, axis=0)
+            trend_coeffs = np.column_stack(
+                [
+                    np.random.uniform(0.5, 1.5, dim) * std,  # amplitude
+                    np.random.uniform(0.5, 2.0, dim),  # rate
+                ]
+            )
+        trend = trend_coeffs[:, 0] * (
+            np.exp(trend_coeffs[:, 1] * t_normalized[:, None]) - 1
+        )
+    elif trend_type == "sinusoidal":
+        if trend_coeffs is None:
+            std = np.std(trajectory, axis=0)
+            trend_coeffs = np.column_stack(
+                [
+                    np.random.uniform(0.5, 2.0, dim) * std,  # amplitude
+                    np.random.uniform(0.5, 3.0, dim),  # frequency
+                ]
+            )
+        trend = trend_coeffs[:, 0] * np.sin(
+            2 * np.pi * trend_coeffs[:, 1] * t_normalized[:, None]
+        )
+    else:
+        raise ValueError(f"Unknown trend type: {trend_type}")
+
+    return trajectory + trend
+
+
+def apply_amplitude_modulation(
+    trajectory: np.ndarray,
+    t: np.ndarray,
+    modulation_type: str = "linear",
+    modulation_params: Optional[Dict] = None,
+) -> np.ndarray:
+    """
+    Apply time-varying amplitude modulation to a trajectory.
+
+    Args:
+        trajectory: Trajectory array of shape (T, dim)
+        t: Time array of shape (T,)
+        modulation_type: Type of modulation ('linear', 'exponential', 'sinusoidal')
+        modulation_params: Parameters for the modulation
+
+    Returns:
+        Amplitude-modulated trajectory
+    """
+    T, dim = trajectory.shape
+    t_normalized = (t - t[0]) / (t[-1] - t[0])
+
+    if modulation_params is None:
+        modulation_params = {}
+
+    if modulation_type == "linear":
+        # Linear amplitude change from a_start to a_end
+        a_start = modulation_params.get("a_start", 0.5)
+        a_end = modulation_params.get("a_end", 2.0)
+        amplitude = a_start + (a_end - a_start) * t_normalized
+    elif modulation_type == "exponential":
+        # Exponential growth/decay
+        rate = modulation_params.get("rate", 1.0)
+        amplitude = np.exp(rate * t_normalized)
+    elif modulation_type == "sinusoidal":
+        # Sinusoidal modulation
+        freq = modulation_params.get("freq", 2.0)
+        depth = modulation_params.get("depth", 0.5)
+        amplitude = 1.0 + depth * np.sin(2 * np.pi * freq * t_normalized)
+    else:
+        raise ValueError(f"Unknown modulation type: {modulation_type}")
+
+    # Center trajectory, apply modulation, then recenter
+    mean = np.mean(trajectory, axis=0, keepdims=True)
+    centered = trajectory - mean
+    modulated = centered * amplitude[:, None]
+
+    return modulated + mean
+
+
+def create_parameter_drift_system(
+    base_system: str,
+    drift_param: str,
+    drift_start: float,
+    drift_end: float,
+    t_total: float,
+):
+    """
+    Create a system with slowly drifting parameters.
+
+    Args:
+        base_system: Name of the base system
+        drift_param: Parameter name to drift
+        drift_start: Starting value of the parameter
+        drift_end: Ending value of the parameter
+        t_total: Total integration time (for normalization)
+
+    Returns:
+        ODE function with time-varying parameter
+    """
+    base_func = SYSTEM_FUNCTIONS[base_system]
+
+    def drifting_system(t: float, state: np.ndarray, **params) -> np.ndarray:
+        # Interpolate the drifting parameter
+        t_normalized = min(t / t_total, 1.0)
+        current_value = drift_start + (drift_end - drift_start) * t_normalized
+
+        # Update the parameter
+        drifting_params = params.copy()
+        drifting_params[drift_param] = current_value
+
+        return base_func(t, state, **drifting_params)
+
+    return drifting_system
+
+
+def create_regime_switching_system(
+    base_system: str,
+    switch_param: str,
+    regime_values: List[float],
+    switch_times: List[float],
+):
+    """
+    Create a system with discrete parameter regime switches.
+
+    Args:
+        base_system: Name of the base system
+        switch_param: Parameter name that switches between regimes
+        regime_values: List of parameter values for each regime
+        switch_times: List of times at which to switch regimes
+
+    Returns:
+        ODE function with regime-switching behavior
+    """
+    base_func = SYSTEM_FUNCTIONS[base_system]
+
+    def switching_system(t: float, state: np.ndarray, **params) -> np.ndarray:
+        # Determine current regime
+        regime_idx = 0
+        for i, switch_time in enumerate(switch_times):
+            if t >= switch_time:
+                regime_idx = i + 1
+
+        # Clamp to valid regime
+        regime_idx = min(regime_idx, len(regime_values) - 1)
+
+        # Update the parameter
+        switching_params = params.copy()
+        switching_params[switch_param] = regime_values[regime_idx]
+
+        return base_func(t, state, **switching_params)
+
+    return switching_system
+
+
+def generate_nonstationary_trajectory(
+    base_system: str,
+    t_span: Tuple[float, float],
+    nonstationarity_type: str,
+    dt: float = 0.01,
+    initial_condition: Optional[np.ndarray] = None,
+    params: Optional[Dict[str, float]] = None,
+    transient_time: float = 0.0,
+    nonstationary_params: Optional[Dict] = None,
+    **kwargs,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generate a nonstationary trajectory from a base dynamical system.
+
+    Args:
+        base_system: Name of the base dynamical system
+        t_span: Time interval (t_start, t_end)
+        nonstationarity_type: Type of nonstationarity:
+            - 'trend_polynomial': Add polynomial trend
+            - 'trend_exponential': Add exponential trend
+            - 'trend_sinusoidal': Add sinusoidal trend
+            - 'amplitude_linear': Linear amplitude modulation
+            - 'amplitude_exponential': Exponential amplitude modulation
+            - 'amplitude_sinusoidal': Sinusoidal amplitude modulation
+            - 'parameter_drift': Slowly drifting parameter
+            - 'regime_switch': Discrete regime switches
+        dt: Time step for output
+        initial_condition: Initial state vector
+        params: System parameters
+        transient_time: Time to discard for transients
+        nonstationary_params: Parameters specific to the nonstationarity type
+        **kwargs: Additional arguments passed to generate_trajectory
+
+    Returns:
+        t: Time array
+        trajectory: Nonstationary trajectory array of shape (T, dim)
+    """
+    if nonstationary_params is None:
+        nonstationary_params = {}
+
+    # For parameter drift and regime switch, we need to modify the ODE
+    if nonstationarity_type == "parameter_drift":
+        drift_param = nonstationary_params.get("drift_param")
+        if drift_param is None:
+            # Pick a random parameter from the system
+            config = SYSTEM_CONFIGS[base_system]
+            if config.param_ranges:
+                drift_param = list(config.param_ranges.keys())[0]
+            else:
+                raise ValueError(f"System {base_system} has no parameters to drift")
+
+        drift_range = nonstationary_params.get("drift_range")
+        if drift_range is None:
+            config = SYSTEM_CONFIGS[base_system]
+            if drift_param in config.param_ranges:
+                low, high = config.param_ranges[drift_param]
+                drift_range = (low, high)
+            else:
+                default_val = config.default_params.get(drift_param, 1.0)
+                drift_range = (default_val * 0.8, default_val * 1.2)
+
+        t_total = t_span[1] - t_span[0] + transient_time
+
+        # Create drifting system
+        drifting_func = create_parameter_drift_system(
+            base_system, drift_param, drift_range[0], drift_range[1], t_total
+        )
+
+        # Get config for the base system
+        config = SYSTEM_CONFIGS[base_system]
+
+        # Use the drifting function directly with solve_ivp
+        actual_t_span = (t_span[0] - transient_time, t_span[1])
+        t_eval = np.arange(actual_t_span[0], actual_t_span[1], dt)
+
+        if initial_condition is None:
+            ic_range = config.default_ic_range
+            ic = np.random.uniform(ic_range[0], ic_range[1], config.dim)
+        else:
+            ic = initial_condition
+
+        if params is None:
+            params = config.default_params.copy()
+
+        sol = solve_ivp(
+            lambda t, y: drifting_func(t, y, **params),
+            actual_t_span,
+            ic,
+            method="RK45",
+            t_eval=t_eval,
+            rtol=1e-6,
+            atol=1e-8,
+            max_step=dt * 10,
+        )
+
+        if not sol.success or np.any(~np.isfinite(sol.y)):
+            raise RuntimeError(f"Integration failed: {sol.message}")
+
+        # Remove transient
+        transient_steps = int(transient_time / dt)
+        t = sol.t[transient_steps:] - transient_time
+        trajectory = sol.y[:, transient_steps:].T
+
+        return t, trajectory
+
+    elif nonstationarity_type == "regime_switch":
+        switch_param = nonstationary_params.get("switch_param")
+        if switch_param is None:
+            config = SYSTEM_CONFIGS[base_system]
+            if config.param_ranges:
+                switch_param = list(config.param_ranges.keys())[0]
+            else:
+                raise ValueError(
+                    f"System {base_system} has no parameters for regime switching"
+                )
+
+        regime_values = nonstationary_params.get("regime_values")
+        if regime_values is None:
+            config = SYSTEM_CONFIGS[base_system]
+            if switch_param in config.param_ranges:
+                low, high = config.param_ranges[switch_param]
+                # Create 2-3 regimes
+                n_regimes = np.random.randint(2, 4)
+                regime_values = np.linspace(low, high, n_regimes).tolist()
+            else:
+                default_val = config.default_params.get(switch_param, 1.0)
+                regime_values = [default_val * 0.9, default_val * 1.1]
+
+        switch_times = nonstationary_params.get("switch_times")
+        if switch_times is None:
+            t_duration = t_span[1] - t_span[0]
+            n_switches = len(regime_values) - 1
+            switch_times = [
+                t_span[0] + (i + 1) * t_duration / (n_switches + 1)
+                for i in range(n_switches)
+            ]
+
+        # Create switching system
+        switching_func = create_regime_switching_system(
+            base_system, switch_param, regime_values, switch_times
+        )
+
+        # Get config for the base system
+        config = SYSTEM_CONFIGS[base_system]
+
+        actual_t_span = (t_span[0] - transient_time, t_span[1])
+        t_eval = np.arange(actual_t_span[0], actual_t_span[1], dt)
+
+        if initial_condition is None:
+            ic_range = config.default_ic_range
+            ic = np.random.uniform(ic_range[0], ic_range[1], config.dim)
+        else:
+            ic = initial_condition
+
+        if params is None:
+            params = config.default_params.copy()
+
+        sol = solve_ivp(
+            lambda t, y: switching_func(t, y, **params),
+            actual_t_span,
+            ic,
+            method="RK45",
+            t_eval=t_eval,
+            rtol=1e-6,
+            atol=1e-8,
+            max_step=dt * 10,
+        )
+
+        if not sol.success or np.any(~np.isfinite(sol.y)):
+            raise RuntimeError(f"Integration failed: {sol.message}")
+
+        transient_steps = int(transient_time / dt)
+        t = sol.t[transient_steps:] - transient_time
+        trajectory = sol.y[:, transient_steps:].T
+
+        return t, trajectory
+
+    else:
+        # For trend and amplitude modulation, generate base trajectory first
+        t, trajectory = generate_trajectory(
+            system=base_system,
+            t_span=t_span,
+            dt=dt,
+            initial_condition=initial_condition,
+            params=params,
+            transient_time=transient_time,
+            **kwargs,
+        )
+
+        # Apply post-processing transformations
+        if nonstationarity_type.startswith("trend_"):
+            trend_type = nonstationarity_type.replace("trend_", "")
+            trajectory = add_trend_to_trajectory(
+                trajectory,
+                t,
+                trend_coeffs=nonstationary_params.get("trend_coeffs"),
+                trend_type=trend_type,
+            )
+        elif nonstationarity_type.startswith("amplitude_"):
+            modulation_type = nonstationarity_type.replace("amplitude_", "")
+            trajectory = apply_amplitude_modulation(
+                trajectory,
+                t,
+                modulation_type=modulation_type,
+                modulation_params=nonstationary_params.get("modulation_params"),
+            )
+        else:
+            raise ValueError(f"Unknown nonstationarity type: {nonstationarity_type}")
+
+        return t, trajectory
+
+
+def generate_nonstationary_training_data(
+    base_systems: Union[str, List[str]],
+    nonstationarity_types: Union[str, List[str]],
+    n_trajectories_per_combination: int = 50,
+    sequence_length: int = 550,
+    context_length: int = 500,
+    dt: float = 0.01,
+    vary_params: bool = True,
+    noise_level: float = 0.0,
+    transient_time: float = 100.0,
+    seed: Optional[int] = None,
+    show_progress: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generate nonstationary training data for DynaMix.
+
+    Creates data with various types of nonstationarity to help the model
+    learn to handle nonstationary time series.
+
+    Args:
+        base_systems: Base system name(s) to use
+        nonstationarity_types: Type(s) of nonstationarity to apply:
+            - 'trend_polynomial', 'trend_exponential', 'trend_sinusoidal'
+            - 'amplitude_linear', 'amplitude_exponential', 'amplitude_sinusoidal'
+            - 'parameter_drift', 'regime_switch'
+        n_trajectories_per_combination: Number of trajectories per system-nonstationarity pair
+        sequence_length: Total sequence length
+        context_length: Context length
+        dt: Time step
+        vary_params: Vary system parameters
+        noise_level: Gaussian noise level
+        transient_time: Transient time to discard
+        seed: Random seed
+        show_progress: Show progress bar
+
+    Returns:
+        data: Training data array
+        context: Context array
+        test: Test array
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    if isinstance(base_systems, str):
+        base_systems = [base_systems]
+    if isinstance(nonstationarity_types, str):
+        nonstationarity_types = [nonstationarity_types]
+
+    all_trajectories = []
+    t_end = (sequence_length + 10) * dt
+
+    combinations = [
+        (sys, ns_type) for sys in base_systems for ns_type in nonstationarity_types
+    ]
+
+    if show_progress:
+        from tqdm import tqdm
+
+        combinations = tqdm(combinations, desc="Generating nonstationary data")
+
+    for base_system, ns_type in combinations:
+        config = SYSTEM_CONFIGS[base_system]
+
+        for _ in range(n_trajectories_per_combination):
+            try:
+                # Vary parameters if requested
+                if vary_params and config.param_ranges:
+                    traj_params = {}
+                    for key, (low, high) in config.param_ranges.items():
+                        traj_params[key] = np.random.uniform(low, high)
+                else:
+                    traj_params = None
+
+                _, traj = generate_nonstationary_trajectory(
+                    base_system=base_system,
+                    t_span=(0, t_end),
+                    nonstationarity_type=ns_type,
+                    dt=dt,
+                    params=traj_params,
+                    transient_time=transient_time,
+                )
+                all_trajectories.append(traj[:sequence_length])
+            except RuntimeError:
+                # Try again with default params
+                try:
+                    _, traj = generate_nonstationary_trajectory(
+                        base_system=base_system,
+                        t_span=(0, t_end),
+                        nonstationarity_type=ns_type,
+                        dt=dt,
+                        params=config.default_params,
+                        transient_time=transient_time,
+                    )
+                    all_trajectories.append(traj[:sequence_length])
+                except RuntimeError:
+                    continue
+
+    if len(all_trajectories) == 0:
+        raise RuntimeError("All nonstationary trajectory generations failed!")
+
+    # Stack trajectories: (T, S, N)
+    trajectories = np.stack(all_trajectories, axis=1)
+
+    # Standardize
+    trajectories = standardize_trajectories(trajectories)
+
+    # Add noise
+    if noise_level > 0:
+        std = np.std(trajectories, axis=0, keepdims=True)
+        noise = np.random.randn(*trajectories.shape) * noise_level * std
+        trajectories = trajectories + noise
+
+    # Split into context and data
+    delta_t = 50
+    context = trajectories[:context_length].copy()
+    data_start = context_length - delta_t
+    data = trajectories[data_start:].copy()
+    test = trajectories.copy()
+
+    return data, context, test
+
+
+# List of nonstationarity types for easy reference
+NONSTATIONARITY_TYPES = [
+    "trend_polynomial",
+    "trend_exponential",
+    "trend_sinusoidal",
+    "amplitude_linear",
+    "amplitude_exponential",
+    "amplitude_sinusoidal",
+    "parameter_drift",
+    "regime_switch",
+]
+
+# Recommended base systems for nonstationary experiments (stable systems)
+NONSTATIONARY_BASE_SYSTEMS = [
+    "lorenz",
+    "rossler",
+    "chen",
+    "thomas",
+    "aizawa",
+    "shimizu_morioka",
+    "lu_chen_cheng",
+    "rucklidge",
+]
+
+
 # Convenience list of all 34 3D training systems
 TRAINING_SYSTEMS_3D = [
     "aizawa",
@@ -1056,6 +1719,7 @@ TRAINING_SYSTEMS_3D = [
     "arneodo",
     "belousov_zhabotinsky",
     "chen",
+    "chua",
     "colpitts",
     "forced_brusselator",
     "forced_vanderpol",
@@ -1079,6 +1743,7 @@ TRAINING_SYSTEMS_3D = [
     "shimizu_morioka",
     "sprott_jerk",
     "sprott_linz",
+    "sprott_m",
     "stick_slip",
     "thomas",
     "windmi",
@@ -1142,8 +1807,15 @@ def generate_trajectory(
     t_eval = np.arange(actual_t_span[0], actual_t_span[1], dt)
 
     last_error = None
-    # Try different methods - LSODA handles stiff systems better
-    methods_to_try = [method, "LSODA"] if method != "LSODA" else ["LSODA"]
+    # Try different methods - order depends on system characteristics
+    # LSODA handles stiff systems, DOP853 is better for smooth non-stiff systems
+    if system == "sprott_jerk":
+        # sprott_jerk works better with explicit methods
+        methods_to_try = ["DOP853", "RK45", "LSODA"]
+    elif method == "LSODA":
+        methods_to_try = ["LSODA", "DOP853"]
+    else:
+        methods_to_try = [method, "LSODA", "DOP853"]
 
     for attempt in range(max_retries):
         # Generate initial condition if not provided (or retry with new one)
@@ -1236,9 +1908,9 @@ def generate_multi_trajectory(
     max_attempts_per_traj = 5
     failed_count = 0
 
-    for i in iterator:
+    for _ in iterator:
         success = False
-        for attempt in range(max_attempts_per_traj):
+        for _ in range(max_attempts_per_traj):
             try:
                 # Vary parameters if requested
                 if vary_params and config.param_ranges:
@@ -1288,6 +1960,101 @@ def generate_multi_trajectory(
     return np.stack(trajectories, axis=1)
 
 
+def _init_worker(counter, lock):
+    """Initialize worker process with shared counter."""
+    global _shared_counter, _shared_lock
+    _shared_counter = counter
+    _shared_lock = lock
+
+
+def _generate_system_data_worker(
+    args: Tuple[str, int, int, float, bool, float, Optional[int]],
+) -> Tuple[str, Optional[np.ndarray], int]:
+    """
+    Worker function to generate data for a single system.
+
+    This function is designed to be called by multiprocessing.Pool.
+
+    Args:
+        args: Tuple of (system, n_trajectories, sequence_length, dt, vary_params,
+              transient_time, seed)
+
+    Returns:
+        Tuple of (system_name, trajectories, failed_count) where:
+        - system_name: Name of the system
+        - trajectories: Array of shape (sequence_length, n_trajectories, dim) or None if all failed
+        - failed_count: Number of trajectories that failed and were skipped
+    """
+    global _shared_counter, _shared_lock
+
+    system, n_trajectories, sequence_length, dt, vary_params, transient_time, seed = (
+        args
+    )
+
+    if seed is not None:
+        np.random.seed(seed)
+
+    config = SYSTEM_CONFIGS[system]
+    t_end = (sequence_length + 10) * dt  # Extra buffer
+    t_span = (0, t_end)
+
+    trajectories = []
+    max_attempts_per_traj = 10  # Increased from 5
+    failed_count = 0
+
+    for _ in range(n_trajectories):
+        success = False
+        for _ in range(max_attempts_per_traj):
+            try:
+                # Vary parameters if requested
+                if vary_params and config.param_ranges:
+                    traj_params = {}
+                    for key, (low, high) in config.param_ranges.items():
+                        traj_params[key] = np.random.uniform(low, high)
+                else:
+                    traj_params = None
+
+                _, traj = generate_trajectory(
+                    system=system,
+                    t_span=t_span,
+                    dt=dt,
+                    params=traj_params,
+                    transient_time=100.0,
+                )
+                trajectories.append(traj[:sequence_length])
+                success = True
+                break
+            except RuntimeError:
+                continue
+
+        if not success:
+            # Fallback to default params
+            try:
+                _, traj = generate_trajectory(
+                    system=system,
+                    t_span=t_span,
+                    dt=dt,
+                    params=config.default_params,
+                    transient_time=100.0,
+                )
+                trajectories.append(traj[:sequence_length])
+            except RuntimeError:
+                # Skip this trajectory instead of crashing
+                failed_count += 1
+
+        # Update shared progress counter
+        if _shared_counter is not None:
+            with _shared_lock:
+                _shared_counter.value += 1
+
+    # Return None if all trajectories failed
+    if len(trajectories) == 0:
+        return (system, None, failed_count)
+
+    # Stack: (T, S, N)
+    return (system, np.stack(trajectories, axis=1), failed_count)
+
+
 def generate_training_data(
     systems: Union[str, List[str]],
     n_trajectories_per_system: int = 100,
@@ -1299,6 +2066,8 @@ def generate_training_data(
     transient_time: float = 100.0,
     seed: Optional[int] = None,
     show_progress: bool = True,
+    n_workers: Optional[int] = None,
+    save_intermediate: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Generate training data in the format expected by DynaMix.
@@ -1319,12 +2088,19 @@ def generate_training_data(
         transient_time: Transient time to discard
         seed: Random seed
         show_progress: Show progress bar
+        n_workers: Number of parallel workers (default: None = sequential,
+                   0 or negative = use all available CPUs)
+        save_intermediate: Directory to save intermediate results per system.
+                          If provided, data is saved after each system completes,
+                          allowing recovery if generation fails partway through.
 
     Returns:
         data: Training data array
         context: Context array
         test: Test array
     """
+    import os
+
     if seed is not None:
         np.random.seed(seed)
 
@@ -1332,24 +2108,148 @@ def generate_training_data(
         systems = [systems]
 
     all_trajectories = []
+    failed_systems = []
+    total_failed_trajectories = 0
 
-    system_iterator = systems
+    # Create intermediate save directory if specified
+    if save_intermediate:
+        os.makedirs(save_intermediate, exist_ok=True)
+        intermediate_raw_dir = os.path.join(save_intermediate, "raw_systems")
+        os.makedirs(intermediate_raw_dir, exist_ok=True)
+
+    # Determine if we should use parallel processing
+    use_parallel = n_workers is not None and len(systems) > 1
+
+    if use_parallel:
+        import time
+
+        # Determine number of workers
+        if n_workers <= 0:
+            actual_workers = cpu_count()
+        else:
+            actual_workers = min(n_workers, len(systems), cpu_count())
+
+        if show_progress:
+            print(f"Using {actual_workers} parallel workers for {len(systems)} systems")
+
+        # Create worker arguments with unique seeds for reproducibility
+        worker_args = []
+        for i, system in enumerate(systems):
+            # Create unique seed for each system based on base seed
+            system_seed = seed + i if seed is not None else None
+            worker_args.append(
+                (
+                    system,
+                    n_trajectories_per_system,
+                    sequence_length,
+                    dt,
+                    vary_params,
+                    transient_time,
+                    system_seed,
+                )
+            )
+
+        # Create shared counter for progress tracking
+        manager = Manager()
+        counter = manager.Value("i", 0)
+        lock = manager.Lock()
+
+        total_trajectories = len(systems) * n_trajectories_per_system
+
+        # Use multiprocessing pool with shared counter
+        with Pool(
+            processes=actual_workers,
+            initializer=_init_worker,
+            initargs=(counter, lock),
+        ) as pool:
+            if show_progress:
+                # Start async map
+                async_result = pool.map_async(_generate_system_data_worker, worker_args)
+
+                # Progress bar that polls the shared counter
+                with tqdm(
+                    total=total_trajectories, desc="Generating", unit="traj"
+                ) as pbar:
+                    last_count = 0
+                    while not async_result.ready():
+                        current_count = counter.value
+                        if current_count > last_count:
+                            pbar.update(current_count - last_count)
+                            last_count = current_count
+                        time.sleep(0.1)
+                    # Final update
+                    current_count = counter.value
+                    if current_count > last_count:
+                        pbar.update(current_count - last_count)
+
+                results = async_result.get()
+            else:
+                results = pool.map(_generate_system_data_worker, worker_args)
+
+        # Process results - handle failures gracefully
+        for system_name, trajectories, failed_count in results:
+            if trajectories is None:
+                failed_systems.append(system_name)
+                if show_progress:
+                    print(
+                        f"  Warning: System {system_name} failed completely ({failed_count} trajectories)"
+                    )
+            else:
+                all_trajectories.append(trajectories)
+                total_failed_trajectories += failed_count
+                if failed_count > 0 and show_progress:
+                    print(
+                        f"  Warning: System {system_name} had {failed_count} failed trajectories"
+                    )
+                # Save intermediate result
+                if save_intermediate:
+                    np.save(
+                        os.path.join(intermediate_raw_dir, f"{system_name}.npy"),
+                        trajectories.astype(np.float32),
+                    )
+
+    else:
+        # Sequential processing (original behavior)
+        system_iterator = systems
+        if show_progress:
+            system_iterator = tqdm(systems, desc="Generating", unit="system")
+
+        for system in system_iterator:
+            t_end = (sequence_length + 10) * dt  # Extra buffer
+            try:
+                trajs = generate_multi_trajectory(
+                    system=system,
+                    n_trajectories=n_trajectories_per_system,
+                    t_span=(0, t_end),
+                    dt=dt,
+                    vary_params=vary_params,
+                    transient_time=transient_time,
+                    seed=None,  # Don't reset seed for each system
+                    show_progress=show_progress,
+                )
+                all_trajectories.append(trajs[:sequence_length])
+                # Save intermediate result
+                if save_intermediate:
+                    np.save(
+                        os.path.join(intermediate_raw_dir, f"{system}.npy"),
+                        trajs[:sequence_length].astype(np.float32),
+                    )
+            except RuntimeError as e:
+                failed_systems.append(system)
+                if show_progress:
+                    print(f"  Warning: System {system} failed: {e}")
+
+    # Check if we have any successful data
+    if len(all_trajectories) == 0:
+        raise RuntimeError(f"All systems failed! Failed systems: {failed_systems}")
+
+    # Report on failures
     if show_progress:
-        system_iterator = tqdm(systems, desc="Generating", unit="system")
-
-    for system in system_iterator:
-        t_end = (sequence_length + 10) * dt  # Extra buffer
-        trajs = generate_multi_trajectory(
-            system=system,
-            n_trajectories=n_trajectories_per_system,
-            t_span=(0, t_end),
-            dt=dt,
-            vary_params=vary_params,
-            transient_time=transient_time,
-            seed=None,  # Don't reset seed for each system
-            show_progress=show_progress,
-        )
-        all_trajectories.append(trajs[:sequence_length])
+        if failed_systems:
+            print(f"\nFailed systems ({len(failed_systems)}): {failed_systems}")
+        if total_failed_trajectories > 0:
+            print(f"Total failed trajectories: {total_failed_trajectories}")
+        print(f"Successfully generated data from {len(all_trajectories)} systems")
 
     # Combine all systems: (T, S_total, N)
     trajectories = np.concatenate(all_trajectories, axis=1)
@@ -1533,7 +2433,18 @@ if __name__ == "__main__":
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel workers (default: sequential, 0 = all CPUs)",
+    )
+    parser.add_argument(
         "--list_systems", action="store_true", help="List available systems and exit"
+    )
+    parser.add_argument(
+        "--save_intermediate",
+        action="store_true",
+        help="Save intermediate results per system (enables recovery on failure)",
     )
 
     args = parser.parse_args()
@@ -1577,6 +2488,14 @@ if __name__ == "__main__":
     print(f"  Context length: {args.context_length}")
     print(f"  Time step: {args.dt}")
     print(f"  Noise level: {args.noise}")
+    if args.workers is not None:
+        workers_str = "all CPUs" if args.workers <= 0 else str(args.workers)
+        print(f"  Parallel workers: {workers_str}")
+    if args.save_intermediate:
+        print(f"  Intermediate saving: enabled (to {args.save_dir}/raw_systems/)")
+
+    # Use save_dir for intermediate results if enabled
+    intermediate_dir = args.save_dir if args.save_intermediate else None
 
     data, context, test = generate_training_data(
         systems=systems,
@@ -1586,6 +2505,8 @@ if __name__ == "__main__":
         dt=args.dt,
         noise_level=args.noise,
         seed=args.seed,
+        n_workers=args.workers,
+        save_intermediate=intermediate_dir,
     )
 
     save_training_data(args.save_dir, data, context, test)
